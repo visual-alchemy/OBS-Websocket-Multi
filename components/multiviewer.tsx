@@ -18,6 +18,8 @@ interface OBSConnection {
   error?: string
   lastUpdate?: number
   lastAttemptTime?: number;
+  sessionConnected?: boolean; // Track if we've connected in this session
+  locked?: boolean; // Lock status to prevent reconnection attempts
 }
 
 // List of OBS connections
@@ -223,12 +225,13 @@ export function Multiviewer() {
   const [filter, setFilter] = useState<"visible" | "all" | "primary" | "backup">("all")
   const obsInstancesRef = useRef<Map<string, OBSWebSocket>>(new Map())
   const intervalRef = useRef<NodeJS.Timeout | null>(null)
+  const sessionConnectionsRef = useRef<Set<string>>(new Set()) // Track connections made in this session
 
   // Initialize connections map
   useEffect(() => {
     const initialConnections = new Map<string, OBSConnection>()
     obsConnections.forEach((conn) => {
-      initialConnections.set(conn.address, { ...conn })
+      initialConnections.set(conn.address, { ...conn, locked: false })
     })
     setConnections(initialConnections)
   }, [])
@@ -255,7 +258,68 @@ export function Multiviewer() {
   // Get screenshot from a single OBS instance
   const getScreenshotFromOBS = useCallback(
     async (conn: OBSConnection) => {
-      // Cooldown period before attempting to connect again (e.g., 5 seconds)
+      // If connection is locked and already connected, just get the screenshot without reconnection attempts
+      if (conn.locked && conn.connected) {
+        try {
+          const obs = obsInstancesRef.current.get(conn.address);
+          if (obs && obs.identified) {
+            // Just get the screenshot without reconnection logic
+            const apiTimeout = 1500;
+            
+            try {
+              const getScenePromise = obs.call("GetCurrentProgramScene");
+              const sceneTimeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("Get scene timeout")), apiTimeout)
+              );
+              
+              const { currentProgramSceneName } = await Promise.race([getScenePromise, sceneTimeoutPromise]) as { currentProgramSceneName: string };
+              
+              const getScreenshotPromise = obs.call("GetSourceScreenshot", {
+                sourceName: currentProgramSceneName,
+                imageFormat: "jpg",
+                imageWidth: 320,
+                imageHeight: 180,
+              });
+              
+              const screenshotTimeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("Get screenshot timeout")), apiTimeout)
+              );
+              
+              const { imageData } = await Promise.race([getScreenshotPromise, screenshotTimeoutPromise]) as { imageData: string };
+              
+              // Update only the screenshot
+              updateConnection(conn.address, { screenshot: imageData });
+            } catch (error) {
+              // If screenshot fetch fails for a locked connection, unlock it to allow reconnection
+              updateConnection(conn.address, { 
+                locked: false,
+                error: "Screenshot fetch failed - connection unlocked"
+              });
+            }
+            return;
+          }
+        } catch (error) {
+          // If any error occurs with a locked connection, unlock it
+          updateConnection(conn.address, { 
+            locked: false,
+            connected: false,
+            error: "Connection error - unlocked"
+          });
+        }
+      }
+
+      // Check if we've already connected to this OBS instance in this session
+      if (sessionConnectionsRef.current.has(conn.address) && !obsInstancesRef.current.get(conn.address)?.identified) {
+        // We've tried to connect in this session but it failed, don't retry constantly
+        const cooldown = 30000; // 30 seconds between retries for failed connections
+        const now = Date.now();
+        
+        if (conn.lastAttemptTime && now - conn.lastAttemptTime < cooldown) {
+          return; // Skip until cooldown expires
+        }
+      }
+
+      // Standard cooldown for connection attempts (5 seconds)
       const cooldown = 5000;
       const now = Date.now();
 
@@ -273,6 +337,15 @@ export function Multiviewer() {
 
         // Create new connection if it doesn't exist or is disconnected
         if (!obs || !obs.identified) {
+          // If we've already tried to connect in this session and failed, don't keep trying constantly
+          if (sessionConnectionsRef.current.has(conn.address) && !conn.sessionConnected) {
+            updateConnection(conn.address, { 
+              connected: false,
+              error: "Connection failed - will retry later" 
+            });
+            return;
+          }
+
           obs = new OBSWebSocket();
           obsInstancesRef.current.set(conn.address, obs);
 
@@ -287,8 +360,16 @@ export function Multiviewer() {
 
           await Promise.race([connectPromise, timeoutPromise])
 
-          // Update connection status
-          updateConnection(conn.address, { connected: true, error: undefined })
+          // Mark that we've connected in this session
+          sessionConnectionsRef.current.add(conn.address);
+          
+          // Update connection status and lock it by default when successfully connected
+          updateConnection(conn.address, { 
+            connected: true, 
+            error: undefined,
+            sessionConnected: true,
+            locked: true // Lock the connection once established
+          });
         }
 
         // If connected (either just connected or already connected), get scene and screenshot
@@ -315,19 +396,27 @@ export function Multiviewer() {
 
           const { imageData } = await Promise.race([getScreenshotPromise(currentProgramSceneName), screenshotTimeoutPromise]) as { imageData: string };
 
-          // Update only the screenshot
-          updateConnection(conn.address, { screenshot: imageData, error: undefined })
-
+          // Update only the screenshot and ensure connection is locked
+          updateConnection(conn.address, { 
+            screenshot: imageData, 
+            error: undefined,
+            locked: true
+          });
         } else if (obs && !obs.identified) {
            // Handle case where connection was attempted but not identified (e.g., auth failure)
+           sessionConnectionsRef.current.add(conn.address); // Mark that we've tried this session
            updateConnection(conn.address, {
               connected: false,
               error: "Connection not identified",
+              sessionConnected: false,
+              locked: false
             });
         }
 
       } catch (error) {
         // Connection or API call failed
+        sessionConnectionsRef.current.add(conn.address); // Mark that we've tried this session
+        
         const obs = obsInstancesRef.current.get(conn.address)
         if (obs) {
           // If the error was during connection, the instance might still be there but not identified
@@ -337,6 +426,8 @@ export function Multiviewer() {
           updateConnection(conn.address, {
             connected: false,
             error: error instanceof Error ? error.message : "Unknown error",
+            sessionConnected: false,
+            locked: false
           });
         }
         // No need to delete the instance here, it's handled by the !obs.identified check on the next interval
@@ -349,9 +440,6 @@ export function Multiviewer() {
   const fetchAllScreenshots = useCallback(async () => {
     const promises = obsConnections.map((conn) => getScreenshotFromOBS(conn))
     await Promise.allSettled(promises)
-    // for (const conn of obsConnections) {
-    //   await getScreenshotFromOBS(conn);
-    // }
   }, [getScreenshotFromOBS])
 
   // Start/stop the screenshot fetching interval
@@ -359,8 +447,8 @@ export function Multiviewer() {
     // Initial fetch
     fetchAllScreenshots()
 
-    // Set up interval
-    intervalRef.current = setInterval(fetchAllScreenshots, 125) // 8fps
+    // Set up interval - reduced from 125ms (8fps) to 1000ms (1fps) to reduce load
+    intervalRef.current = setInterval(fetchAllScreenshots, 1000) 
 
     return () => {
       if (intervalRef.current) {
@@ -376,6 +464,35 @@ export function Multiviewer() {
     }
   }, [fetchAllScreenshots])
 
+  // Manual refresh button handler
+  const handleRefresh = useCallback(() => {
+    // Clear session connections to allow reconnection attempts
+    sessionConnectionsRef.current.clear();
+    
+    // Unlock all connections
+    setConnections(prev => {
+      const newMap = new Map(prev);
+      for (const [address, conn] of newMap.entries()) {
+        newMap.set(address, { ...conn, locked: false });
+      }
+      return newMap;
+    });
+    
+    fetchAllScreenshots();
+  }, [fetchAllScreenshots]);
+
+  // Toggle lock for a specific connection
+  const toggleLock = useCallback((address: string) => {
+    setConnections(prev => {
+      const newMap = new Map(prev);
+      const conn = newMap.get(address);
+      if (conn) {
+        newMap.set(address, { ...conn, locked: !conn.locked });
+      }
+      return newMap;
+    });
+  }, []);
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap gap-2 items-center justify-between">
@@ -384,6 +501,10 @@ export function Multiviewer() {
           <h1 className="text-2xl font-bold">OBS Multiviewer Dashboard</h1>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Button variant="outline" size="sm" onClick={handleRefresh} className="flex items-center gap-1">
+            <RefreshCw className="h-4 w-4" />
+            Refresh All
+          </Button>
           <Tabs defaultValue="all" onValueChange={(value) => setFilter(value as any)}>
             <TabsList>
               <TabsTrigger value="all">All</TabsTrigger>
@@ -419,7 +540,16 @@ export function Multiviewer() {
                 <div className="text-xs text-gray-400 truncate">{conn.address}</div>
                 {conn.error && <div className="text-xs text-red-400 truncate">{conn.error}</div>}
               </div>
-              <div className="absolute top-2 right-2">
+              <div className="absolute top-2 right-2 flex gap-1">
+                <Button 
+                  variant="ghost" 
+                  size="icon" 
+                  className={`h-5 w-5 p-0 ${conn.locked ? 'bg-yellow-500/20' : 'bg-transparent'}`}
+                  onClick={() => toggleLock(conn.address)}
+                  title={conn.locked ? "Connection locked (click to unlock)" : "Connection unlocked (click to lock)"}
+                >
+                  {conn.locked ? '🔒' : '🔓'}
+                </Button>
                 <span
                   className={`inline-block w-3 h-3 rounded-full ${conn.connected ? "bg-green-500" : "bg-red-500"}`}
                 ></span>
