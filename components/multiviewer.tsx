@@ -5,7 +5,7 @@ import OBSWebSocket from "obs-websocket-js"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { AlertCircle, Eye, EyeOff, RefreshCw } from "lucide-react"
+import { AlertCircle, RefreshCw } from "lucide-react"
 
 // Define the OBS connection type
 interface OBSConnection {
@@ -507,18 +507,6 @@ export function Multiviewer() {
     });
   }, []);
 
-  // Toggle visibility for a specific connection
-  const toggleVisibility = useCallback((address: string) => {
-    setConnections(prev => {
-      const newMap = new Map(prev);
-      const conn = newMap.get(address);
-      if (conn) {
-        newMap.set(address, { ...conn, show: !conn.show });
-      }
-      return newMap;
-    });
-  }, []);
-
   // Count active feeds
   const activeCount = activeConnections.length;
   // Count total feeds
@@ -617,30 +605,24 @@ export function Multiviewer() {
             {inactiveConnections.map((conn) => (
               <div 
                 key={conn.address} 
-                className={`flex items-center justify-between p-2 rounded border ${conn.category === "primary" ? "border-blue-600" : "border-orange-600"} bg-gray-900`}
+                className={`flex items-center p-2 rounded border ${conn.category === "primary" ? "border-blue-600" : "border-orange-600"} bg-gray-900`}
               >
-                <div className="flex items-center gap-2">
-                  <span className={`inline-block w-3 h-3 rounded-full bg-red-500`}></span>
-                  <div>
-                    <div className="text-xs font-medium">
-                      {conn.name.split(" - ")[0].split(" ")[0]} {conn.address.split(":").pop()}
-                      <span className={`ml-2 text-[10px] px-1 py-0.5 rounded ${conn.category === "primary" ? "bg-blue-600" : "bg-orange-600"}`}>
-                        {conn.category === "primary" ? "P" : "B"}
-                      </span>
+                <div className="flex items-center gap-2 w-full">
+                  <span className={`inline-block min-w-[12px] w-3 h-3 rounded-full bg-red-500`}></span>
+                  <div className="w-full">
+                    <div className="flex justify-between items-center">
+                      <div className="text-xs font-medium">
+                        {conn.name.split(" - ")[0]}
+                        <span className={`ml-2 text-[10px] px-1 py-0.5 rounded ${conn.category === "primary" ? "bg-blue-600" : "bg-orange-600"}`}>
+                          {conn.category === "primary" ? "P" : "B"}
+                        </span>
+                      </div>
                     </div>
-                    {conn.error && <div className="text-[10px] text-red-400 truncate">{conn.error}</div>}
+                    <div className="text-[10px] text-gray-400 truncate">
+                      {conn.address.replace('ws://', '')}
+                    </div>
+                    {conn.error && <div className="text-[10px] text-red-400 truncate">Connection failed - will retry later</div>}
                   </div>
-                </div>
-                <div className="flex gap-1">
-                  <Button 
-                    variant="ghost" 
-                    size="icon" 
-                    className="h-5 w-5 p-0" 
-                    onClick={() => toggleVisibility(conn.address)}
-                    title={conn.show ? "Hide connection" : "Show connection"}
-                  >
-                    {conn.show ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
-                  </Button>
                 </div>
               </div>
             ))}
