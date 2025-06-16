@@ -5,7 +5,7 @@ import OBSWebSocket from "obs-websocket-js"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { AlertCircle, RefreshCw } from "lucide-react"
+import { AlertCircle, Eye, EyeOff, RefreshCw } from "lucide-react"
 
 // Define the OBS connection type
 interface OBSConnection {
@@ -236,12 +236,26 @@ export function Multiviewer() {
     setConnections(initialConnections)
   }, [])
 
-  // Filter connections based on the selected filter
-  const filteredConnections = Array.from(connections.values()).filter((conn) => {
+  // Filter connections based on the selected filter and connection status
+  const activeConnections = Array.from(connections.values()).filter((conn) => {
+    // Active connections are those that are connected
+    if (!conn.connected) return false;
+    
+    // Apply category filter if needed
     if (filter === "primary") return conn.category === "primary"
     if (filter === "backup") return conn.category === "backup"
-    return true // 'all' filter
-  })
+    return true; // 'all' filter
+  });
+
+  const inactiveConnections = Array.from(connections.values()).filter((conn) => {
+    // Inactive connections are those that are not connected
+    if (conn.connected) return false;
+    
+    // Apply category filter if needed
+    if (filter === "primary") return conn.category === "primary"
+    if (filter === "backup") return conn.category === "backup"
+    return true; // 'all' filter
+  });
 
   // Update a single connection without causing full re-render
   const updateConnection = useCallback((address: string, updates: Partial<OBSConnection>) => {
@@ -493,8 +507,27 @@ export function Multiviewer() {
     });
   }, []);
 
+  // Toggle visibility for a specific connection
+  const toggleVisibility = useCallback((address: string) => {
+    setConnections(prev => {
+      const newMap = new Map(prev);
+      const conn = newMap.get(address);
+      if (conn) {
+        newMap.set(address, { ...conn, show: !conn.show });
+      }
+      return newMap;
+    });
+  }, []);
+
+  // Count active feeds
+  const activeCount = activeConnections.length;
+  // Count total feeds
+  const totalCount = obsConnections.length;
+  // Count hidden feeds
+  const hiddenCount = inactiveConnections.length;
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <div className="flex flex-wrap gap-2 items-center justify-between">
         <div className="flex items-center gap-3">
           <img src="/Logo-Vidio-Apps.png" alt="Vidio Logo" className="h-8 w-auto" />
@@ -515,56 +548,105 @@ export function Multiviewer() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-[10px]">
-        {filteredConnections.map((conn) => (
-          <Card
-            key={conn.address}
-            className={`overflow-hidden ${conn.connected ? "border-green-500" : "border-red-500"}`}
-          >
-            <CardContent className="p-0 relative">
-              {conn.screenshot ? (
-                <img
-                  src={conn.screenshot || "/placeholder.svg"}
-                  alt={conn.name}
-                  className="w-full aspect-video object-cover"
-                />
-              ) : (
-                <div className="w-full aspect-video bg-gray-800 flex items-center justify-center">
-                  <AlertCircle className="h-8 w-8 text-red-500" />
+      {/* Active Feeds Section */}
+      <div className="space-y-2">
+        <h2 className="text-lg font-semibold flex items-center gap-2">
+          Active Feeds <span className="text-sm font-normal text-gray-400">({activeCount} feeds • Updates every 1 second)</span>
+        </h2>
+        
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-[10px]">
+          {activeConnections.map((conn) => (
+            <Card
+              key={conn.address}
+              className={`overflow-hidden ${conn.connected ? "border-green-500" : "border-red-500"}`}
+            >
+              <CardContent className="p-0 relative">
+                {conn.screenshot ? (
+                  <img
+                    src={conn.screenshot || "/placeholder.svg"}
+                    alt={conn.name}
+                    className="w-full aspect-video object-cover"
+                  />
+                ) : (
+                  <div className="w-full aspect-video bg-gray-800 flex items-center justify-center">
+                    <AlertCircle className="h-8 w-8 text-red-500" />
+                  </div>
+                )}
+                <div className="absolute bottom-0 left-0 right-0 bg-black/80 p-2">
+                  <div className="text-xs font-medium truncate">
+                    {conn.name.split(" - ")[0]} - {conn.address.split(":").pop()}
+                  </div>
+                  <div className="text-xs text-gray-400 truncate">{conn.address}</div>
+                  {conn.error && <div className="text-xs text-red-400 truncate">{conn.error}</div>}
                 </div>
-              )}
-              <div className="absolute bottom-0 left-0 right-0 bg-black/80 p-2">
-                <div className="text-xs font-medium truncate">
-                  {conn.name.split(" - ")[0]} - {conn.address.split(":").pop()}
+                <div className="absolute top-2 right-2 flex gap-1">
+                  <Button 
+                    variant="ghost" 
+                    size="icon" 
+                    className={`h-5 w-5 p-0 ${conn.locked ? 'bg-yellow-500/20' : 'bg-transparent'}`}
+                    onClick={() => toggleLock(conn.address)}
+                    title={conn.locked ? "Connection locked (click to unlock)" : "Connection unlocked (click to lock)"}
+                  >
+                    {conn.locked ? '🔒' : '🔓'}
+                  </Button>
+                  <span
+                    className={`inline-block w-3 h-3 rounded-full ${conn.connected ? "bg-green-500" : "bg-red-500"}`}
+                  ></span>
                 </div>
-                <div className="text-xs text-gray-400 truncate">{conn.address}</div>
-                {conn.error && <div className="text-xs text-red-400 truncate">{conn.error}</div>}
-              </div>
-              <div className="absolute top-2 right-2 flex gap-1">
-                <Button 
-                  variant="ghost" 
-                  size="icon" 
-                  className={`h-5 w-5 p-0 ${conn.locked ? 'bg-yellow-500/20' : 'bg-transparent'}`}
-                  onClick={() => toggleLock(conn.address)}
-                  title={conn.locked ? "Connection locked (click to unlock)" : "Connection unlocked (click to lock)"}
-                >
-                  {conn.locked ? '🔒' : '🔓'}
-                </Button>
-                <span
-                  className={`inline-block w-3 h-3 rounded-full ${conn.connected ? "bg-green-500" : "bg-red-500"}`}
-                ></span>
-              </div>
-              <div className="absolute top-2 left-2">
-                <span
-                  className={`text-xs px-1.5 py-0.5 rounded ${conn.category === "primary" ? "bg-blue-600" : "bg-orange-600"}`}
-                >
-                  {conn.category}
-                </span>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
+                <div className="absolute top-2 left-2">
+                  <span
+                    className={`text-xs px-1.5 py-0.5 rounded ${conn.category === "primary" ? "bg-blue-600" : "bg-orange-600"}`}
+                  >
+                    {conn.category}
+                  </span>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
       </div>
+
+      {/* Hidden/Inactive Feeds Section */}
+      {inactiveConnections.length > 0 && (
+        <div className="space-y-2">
+          <h2 className="text-lg font-semibold flex items-center gap-2">
+            Hidden Feeds <span className="text-sm font-normal text-gray-400">({hiddenCount})</span>
+          </h2>
+          
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-[10px]">
+            {inactiveConnections.map((conn) => (
+              <div 
+                key={conn.address} 
+                className={`flex items-center justify-between p-2 rounded border ${conn.category === "primary" ? "border-blue-600" : "border-orange-600"} bg-gray-900`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className={`inline-block w-3 h-3 rounded-full bg-red-500`}></span>
+                  <div>
+                    <div className="text-xs font-medium">
+                      {conn.name.split(" - ")[0].split(" ")[0]} {conn.address.split(":").pop()}
+                      <span className={`ml-2 text-[10px] px-1 py-0.5 rounded ${conn.category === "primary" ? "bg-blue-600" : "bg-orange-600"}`}>
+                        {conn.category === "primary" ? "P" : "B"}
+                      </span>
+                    </div>
+                    {conn.error && <div className="text-[10px] text-red-400 truncate">{conn.error}</div>}
+                  </div>
+                </div>
+                <div className="flex gap-1">
+                  <Button 
+                    variant="ghost" 
+                    size="icon" 
+                    className="h-5 w-5 p-0" 
+                    onClick={() => toggleVisibility(conn.address)}
+                    title={conn.show ? "Hide connection" : "Show connection"}
+                  >
+                    {conn.show ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
