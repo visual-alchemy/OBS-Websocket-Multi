@@ -20,6 +20,8 @@ interface OBSConnection {
   lastAttemptTime?: number;
   sessionConnected?: boolean; // Track if we've connected in this session
   locked?: boolean; // Lock status to prevent reconnection attempts
+  connecting?: boolean; // Flag to indicate a connection attempt is in progress
+  reconnectAttempts?: number; // Counter for reconnection attempts
 }
 
 // List of OBS connections
@@ -226,15 +228,544 @@ export function Multiviewer() {
   const obsInstancesRef = useRef<Map<string, OBSWebSocket>>(new Map())
   const intervalRef = useRef<NodeJS.Timeout | null>(null)
   const sessionConnectionsRef = useRef<Set<string>>(new Set()) // Track connections made in this session
+  const connectionQueueRef = useRef<string[]>([]) // Queue for pending connections
+  const processingConnectionRef = useRef<boolean>(false) // Flag to indicate if we're currently processing a connection
 
   // Initialize connections map
   useEffect(() => {
     const initialConnections = new Map<string, OBSConnection>()
     obsConnections.forEach((conn) => {
-      initialConnections.set(conn.address, { ...conn, locked: false })
+      initialConnections.set(conn.address, { 
+        ...conn, 
+        locked: false, 
+        connecting: false,
+        reconnectAttempts: 0
+      })
     })
     setConnections(initialConnections)
   }, [])
+
+  // Update a single connection without causing full re-render
+  const updateConnection = useCallback((address: string, updates: Partial<OBSConnection>) => {
+    setConnections((prev) => {
+      const newMap = new Map(prev)
+      const existing = newMap.get(address)
+      if (existing) {
+        newMap.set(address, { ...existing, ...updates, lastUpdate: Date.now() })
+      }
+      return newMap
+    })
+  }, [])
+
+  // Process the connection queue one at a time
+  const processConnectionQueue = useCallback(async () => {
+    if (processingConnectionRef.current || connectionQueueRef.current.length === 0) {
+      return;
+    }
+
+    processingConnectionRef.current = true;
+    const address = connectionQueueRef.current.shift();
+
+    if (address) {
+      try {
+        const conn = connections.get(address);
+        if (!conn) {
+          processingConnectionRef.current = false;
+          return;
+        }
+
+        // Skip if already connected or connecting
+        if (obsInstancesRef.current.get(address)?.identified || conn.connecting) {
+          processingConnectionRef.current = false;
+          return;
+        }
+
+        // Check reconnect attempts - if too many, back off for longer
+        const maxReconnectAttempts = 5;
+        const reconnectAttempts = conn.reconnectAttempts || 0;
+        
+        if (reconnectAttempts >= maxReconnectAttempts) {
+          // Too many reconnection attempts, back off for a longer time
+          console.log(`Too many reconnect attempts for ${address}, backing off`);
+          updateConnection(address, { 
+            error: `Connection failed after ${reconnectAttempts} attempts - backing off`,
+            reconnectAttempts: 0 // Reset counter but will try again later
+          });
+          
+          processingConnectionRef.current = false;
+          
+          // Remove from queue and try again after a much longer delay
+          setTimeout(() => {
+            if (!connectionQueueRef.current.includes(address)) {
+              connectionQueueRef.current.push(address);
+              processConnectionQueue();
+            }
+          }, 60000); // 1 minute backoff
+          
+          return;
+        }
+
+        // Mark as connecting and increment reconnect attempts
+        updateConnection(address, { 
+          connecting: true,
+          reconnectAttempts: reconnectAttempts + 1
+        });
+
+        // Clean up any existing instance
+        const existingObs = obsInstancesRef.current.get(address);
+        if (existingObs) {
+          try {
+            existingObs.disconnect();
+          } catch (e) {
+            // Ignore disconnect errors
+          }
+          obsInstancesRef.current.delete(address);
+        }
+
+        // Wait a moment before creating a new connection to ensure proper cleanup
+        await new Promise(resolve => setTimeout(resolve, 100)); // Reduced delay for higher refresh rate
+
+        // Create new instance
+        const obs = new OBSWebSocket();
+        
+        // Set up event handlers before connecting
+        obs.on('ConnectionClosed', () => {
+          console.log(`Connection closed for ${address}`);
+          updateConnection(address, {
+            connected: false,
+            locked: false,
+            connecting: false,
+            error: "Connection closed by OBS"
+          });
+          obsInstancesRef.current.delete(address);
+        });
+
+        obs.on('ConnectionError', (error) => {
+          console.log(`Connection error for ${address}: ${error}`);
+          updateConnection(address, {
+            connected: false,
+            locked: false,
+            connecting: false,
+            error: "Connection error"
+          });
+          obsInstancesRef.current.delete(address);
+        });
+        
+        // Store the instance before connecting
+        obsInstancesRef.current.set(address, obs);
+
+        // Connect with timeout
+        const connectPromise = obs.connect(address, undefined, {
+          rpcVersion: 1,
+          eventSubscriptions: 0, // Don't subscribe to any events to reduce load
+        });
+
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Connection timeout")), 5000), // Increased timeout
+        );
+
+        await Promise.race([connectPromise, timeoutPromise]);
+
+        // Verify the connection is still valid after connecting
+        if (!obs.identified) {
+          throw new Error("Connection not identified after connect");
+        }
+
+        // Mark that we've connected in this session
+        sessionConnectionsRef.current.add(address);
+        
+        // Update connection status and lock it by default when successfully connected
+        updateConnection(address, { 
+          connected: true, 
+          error: undefined,
+          sessionConnected: true,
+          locked: true, // Lock the connection once established
+          connecting: false
+        });
+        
+        // Wait a moment before making API calls to ensure the connection is stable
+        await new Promise(resolve => setTimeout(resolve, 100)); // Reduced delay for higher refresh rate
+
+        // Get scene and screenshot
+        const apiTimeout = 3000; // Increased timeout for API calls
+
+        const getScenePromise = obs.call("GetCurrentProgramScene");
+        const sceneTimeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Get scene timeout")), apiTimeout)
+        );
+
+        const { currentProgramSceneName } = await Promise.race([getScenePromise, sceneTimeoutPromise]) as { currentProgramSceneName: string };
+
+        const getScreenshotPromise = obs.call("GetSourceScreenshot", {
+          sourceName: currentProgramSceneName,
+          imageFormat: "jpg",
+          imageWidth: 320,
+          imageHeight: 180,
+          imageCompressionQuality: 70, // Add compression to reduce data size
+        });
+
+        const screenshotTimeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Get screenshot timeout")), apiTimeout)
+        );
+
+        const { imageData } = await Promise.race([getScreenshotPromise, screenshotTimeoutPromise]) as { imageData: string };
+
+        // Update only the screenshot and ensure connection is locked
+        updateConnection(address, { 
+          screenshot: imageData, 
+          error: undefined,
+          locked: true
+        });
+      } catch (error) {
+        // Connection or API call failed
+        console.log(`Connection failed for ${address}: ${error instanceof Error ? error.message : "Unknown error"}`);
+        sessionConnectionsRef.current.add(address); // Mark that we've tried this session
+        
+        // Clean up any failed connection attempt
+        const obs = obsInstancesRef.current.get(address);
+        if (obs) {
+          try {
+            obs.disconnect();
+          } catch (e) {
+            // Ignore disconnect errors
+          }
+          obsInstancesRef.current.delete(address);
+        }
+        
+        // Get current reconnect attempts
+        const conn = connections.get(address);
+        const reconnectAttempts = conn?.reconnectAttempts || 0;
+        
+        updateConnection(address, {
+          connected: false,
+          error: error instanceof Error ? error.message : "Unknown error",
+          sessionConnected: false,
+          locked: false,
+          connecting: false,
+          reconnectAttempts: reconnectAttempts // Keep the counter
+        });
+      } finally {
+        processingConnectionRef.current = false;
+        
+        // Process next in queue after a delay
+        // Use a shorter delay for higher refresh rate
+        setTimeout(() => {
+          processConnectionQueue();
+        }, 500); // Reduced delay between connection attempts
+      }
+    } else {
+      processingConnectionRef.current = false;
+    }
+  }, [connections, updateConnection]);
+
+  // Get screenshot from a single OBS instance
+  const getScreenshotFromOBS = useCallback(
+    async (conn: OBSConnection) => {
+      // If connection is locked and already connected, just get the screenshot without reconnection attempts
+      if (conn.locked && conn.connected) {
+        try {
+          const obs = obsInstancesRef.current.get(conn.address);
+          if (obs && obs.identified) {
+            // Just get the screenshot without reconnection logic
+            const apiTimeout = 3000; // Increased timeout
+            
+            try {
+              // For active connections, we'll use a more efficient approach
+              // Skip getting the scene name if we already have a screenshot
+              // This reduces the number of API calls by half for active connections
+              let currentProgramSceneName;
+              
+              if (conn.screenshot) {
+                // If we already have a screenshot, assume the scene hasn't changed
+                // This is a performance optimization
+                currentProgramSceneName = "Current";
+              } else {
+                // If we don't have a screenshot yet, get the scene name
+                const getScenePromise = obs.call("GetCurrentProgramScene");
+                const sceneTimeoutPromise = new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error("Get scene timeout")), apiTimeout)
+                );
+                
+                const result = await Promise.race([getScenePromise, sceneTimeoutPromise]) as { currentProgramSceneName: string };
+                currentProgramSceneName = result.currentProgramSceneName;
+              }
+              
+              const getScreenshotPromise = obs.call("GetSourceScreenshot", {
+                sourceName: currentProgramSceneName,
+                imageFormat: "jpg",
+                imageWidth: 320,
+                imageHeight: 180,
+                imageCompressionQuality: 70, // Add compression to reduce data size
+              });
+              
+              const screenshotTimeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("Get screenshot timeout")), apiTimeout)
+              );
+              
+              const { imageData } = await Promise.race([getScreenshotPromise, screenshotTimeoutPromise]) as { imageData: string };
+              
+              // Update only the screenshot
+              updateConnection(conn.address, { screenshot: imageData });
+            } catch (error) {
+              console.log(`Screenshot fetch error for ${conn.address}: ${error instanceof Error ? error.message : "Unknown error"}`);
+              
+              // Check if the error is due to a disconnection
+              if (obs && !obs.identified) {
+                // Connection was lost, unlock it and mark as disconnected
+                updateConnection(conn.address, { 
+                  locked: false,
+                  connected: false,
+                  error: "Connection lost - will retry later"
+                });
+                
+                // Remove the instance
+                obsInstancesRef.current.delete(conn.address);
+              } else {
+                // If the error mentions "not valid", we need to get the scene name again
+                const errorMessage = error instanceof Error ? error.message : "Unknown error";
+                if (errorMessage.includes("not valid") || errorMessage.includes("not found")) {
+                  // Force refresh the scene name on next update
+                  updateConnection(conn.address, { 
+                    screenshot: undefined,
+                    error: "Refreshing scene..."
+                  });
+                } else {
+                  // Just a screenshot fetch error, keep the connection
+                  updateConnection(conn.address, { 
+                    error: "Screenshot fetch failed - connection maintained"
+                  });
+                }
+              }
+            }
+            return;
+          } else {
+            // Connection was marked as locked but obs is no longer identified
+            // This could happen if OBS closed the connection
+            updateConnection(conn.address, { 
+              locked: false,
+              connected: false,
+              error: "Connection lost - will retry later"
+            });
+            
+            // Remove the instance
+            obsInstancesRef.current.delete(conn.address);
+          }
+        } catch (error) {
+          console.log(`Error with locked connection ${conn.address}: ${error instanceof Error ? error.message : "Unknown error"}`);
+          
+          // If any error occurs with a locked connection, unlock it
+          updateConnection(conn.address, { 
+            locked: false,
+            connected: false,
+            error: "Connection error - unlocked"
+          });
+          
+          // Remove the instance
+          obsInstancesRef.current.delete(conn.address);
+        }
+        return; // Important: return here to prevent reconnection attempts for locked connections
+      }
+
+      // Skip if currently connecting
+      if (conn.connecting) {
+        return;
+      }
+
+      // Check if we've already connected to this OBS instance in this session
+      if (sessionConnectionsRef.current.has(conn.address) && !obsInstancesRef.current.get(conn.address)?.identified) {
+        // We've tried to connect in this session but failed, don't retry constantly
+        const cooldown = 30000; // 30 seconds between retries for failed connections
+        const now = Date.now();
+        
+        if (conn.lastAttemptTime && now - conn.lastAttemptTime < cooldown) {
+          return; // Skip until cooldown expires
+        }
+      }
+
+      // Standard cooldown for connection attempts (5 seconds)
+      const cooldown = 5000;
+      const now = Date.now();
+
+      // Check if enough time has passed since the last attempt
+      if (conn.lastAttemptTime && now - conn.lastAttemptTime < cooldown) {
+        // Too soon to attempt again, skip this interval cycle
+        return;
+      }
+
+      // Check if we already have a valid connection for this address
+      const existingObs = obsInstancesRef.current.get(conn.address);
+      if (existingObs && existingObs.identified) {
+        // We already have a valid connection, just update the status
+        updateConnection(conn.address, { 
+          connected: true,
+          locked: true,
+          sessionConnected: true
+        });
+        
+        // Get the screenshot using the existing connection
+        try {
+          const apiTimeout = 2000; // Increased timeout
+          
+          const getScenePromise = existingObs.call("GetCurrentProgramScene");
+          const sceneTimeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Get scene timeout")), apiTimeout)
+          );
+          
+          const { currentProgramSceneName } = await Promise.race([getScenePromise, sceneTimeoutPromise]) as { currentProgramSceneName: string };
+          
+          const getScreenshotPromise = existingObs.call("GetSourceScreenshot", {
+            sourceName: currentProgramSceneName,
+            imageFormat: "jpg",
+            imageWidth: 320,
+            imageHeight: 180,
+          });
+          
+          const screenshotTimeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Get screenshot timeout")), apiTimeout)
+          );
+          
+          const { imageData } = await Promise.race([getScreenshotPromise, screenshotTimeoutPromise]) as { imageData: string };
+          
+          // Update only the screenshot
+          updateConnection(conn.address, { 
+            screenshot: imageData,
+            error: undefined
+          });
+          return;
+        } catch (error) {
+          // If screenshot fetch fails, check if the connection is still valid
+          if (!existingObs.identified) {
+            // Connection was lost, remove it
+            obsInstancesRef.current.delete(conn.address);
+            updateConnection(conn.address, {
+              connected: false,
+              locked: false,
+              error: "Connection lost during screenshot fetch"
+            });
+          }
+        }
+        return;
+      }
+
+      // Update last attempt time before trying to connect
+      updateConnection(conn.address, { lastAttemptTime: now });
+
+      // Add to connection queue if not already in queue
+      if (!connectionQueueRef.current.includes(conn.address)) {
+        connectionQueueRef.current.push(conn.address);
+        processConnectionQueue();
+      }
+    },
+    [updateConnection, processConnectionQueue],
+  );
+
+  // Fetch screenshots from all connections in parallel
+  const fetchAllScreenshots = useCallback(async () => {
+    // Process existing connections first
+    const connectedPromises = Array.from(connections.values())
+      .filter(conn => conn.connected && obsInstancesRef.current.get(conn.address)?.identified)
+      .map(conn => getScreenshotFromOBS(conn));
+    
+    // Use Promise.all instead of Promise.allSettled for better performance
+    // This will continue even if some promises reject
+    try {
+      await Promise.all(connectedPromises.map(p => p.catch(e => console.log('Screenshot fetch error:', e))));
+    } catch (e) {
+      // Ignore errors
+    }
+    
+    // Then try to connect to disconnected ones (one at a time via queue)
+    const disconnectedConnections = Array.from(connections.values())
+      .filter(conn => !conn.connected && !conn.connecting);
+    
+    for (const conn of disconnectedConnections) {
+      if (!connectionQueueRef.current.includes(conn.address)) {
+        connectionQueueRef.current.push(conn.address);
+      }
+    }
+    
+    // Start processing the queue if not already processing
+    if (!processingConnectionRef.current) {
+      processConnectionQueue();
+    }
+  }, [getScreenshotFromOBS, connections, processConnectionQueue]);
+
+  // Start/stop the screenshot fetching interval
+  useEffect(() => {
+    // Initial fetch
+    fetchAllScreenshots()
+
+    // Set up interval - update at 6fps (every ~167ms)
+    intervalRef.current = setInterval(fetchAllScreenshots, 167) 
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+      }
+      // Clean up OBS connections
+      obsInstancesRef.current.forEach((obs) => {
+        try {
+          if (obs.identified) {
+            obs.disconnect()
+          }
+        } catch (e) {
+          // Ignore disconnect errors
+        }
+      })
+      obsInstancesRef.current.clear()
+      sessionConnectionsRef.current.clear()
+      connectionQueueRef.current = []
+      processingConnectionRef.current = false
+    }
+  }, [fetchAllScreenshots])
+
+  // Manual refresh button handler
+  const handleRefresh = useCallback(() => {
+    // Clear session connections to allow reconnection attempts
+    sessionConnectionsRef.current.clear();
+    
+    // Unlock all connections and reset reconnect attempts
+    setConnections(prev => {
+      const newMap = new Map(prev);
+      for (const [address, conn] of newMap.entries()) {
+        newMap.set(address, { 
+          ...conn, 
+          locked: false, 
+          connecting: false,
+          reconnectAttempts: 0 // Reset reconnect attempts on manual refresh
+        });
+      }
+      return newMap;
+    });
+    
+    // Clear the connection queue
+    connectionQueueRef.current = [];
+    processingConnectionRef.current = false;
+    
+    // Clean up existing connections
+    obsInstancesRef.current.forEach((obs) => {
+      try {
+        obs.disconnect();
+      } catch (e) {
+        // Ignore disconnect errors
+      }
+    });
+    obsInstancesRef.current.clear();
+    
+    fetchAllScreenshots();
+  }, [fetchAllScreenshots]);
+
+  // Toggle lock for a specific connection
+  const toggleLock = useCallback((address: string) => {
+    setConnections(prev => {
+      const newMap = new Map(prev);
+      const conn = newMap.get(address);
+      if (conn) {
+        newMap.set(address, { ...conn, locked: !conn.locked });
+      }
+      return newMap;
+    });
+  }, []);
 
   // Filter connections based on the selected filter and connection status
   const activeConnections = Array.from(connections.values()).filter((conn) => {
@@ -256,256 +787,6 @@ export function Multiviewer() {
     if (filter === "backup") return conn.category === "backup"
     return true; // 'all' filter
   });
-
-  // Update a single connection without causing full re-render
-  const updateConnection = useCallback((address: string, updates: Partial<OBSConnection>) => {
-    setConnections((prev) => {
-      const newMap = new Map(prev)
-      const existing = newMap.get(address)
-      if (existing) {
-        newMap.set(address, { ...existing, ...updates, lastUpdate: Date.now() })
-      }
-      return newMap
-    })
-  }, [])
-
-  // Get screenshot from a single OBS instance
-  const getScreenshotFromOBS = useCallback(
-    async (conn: OBSConnection) => {
-      // If connection is locked and already connected, just get the screenshot without reconnection attempts
-      if (conn.locked && conn.connected) {
-        try {
-          const obs = obsInstancesRef.current.get(conn.address);
-          if (obs && obs.identified) {
-            // Just get the screenshot without reconnection logic
-            const apiTimeout = 1500;
-            
-            try {
-              const getScenePromise = obs.call("GetCurrentProgramScene");
-              const sceneTimeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error("Get scene timeout")), apiTimeout)
-              );
-              
-              const { currentProgramSceneName } = await Promise.race([getScenePromise, sceneTimeoutPromise]) as { currentProgramSceneName: string };
-              
-              const getScreenshotPromise = obs.call("GetSourceScreenshot", {
-                sourceName: currentProgramSceneName,
-                imageFormat: "jpg",
-                imageWidth: 320,
-                imageHeight: 180,
-              });
-              
-              const screenshotTimeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error("Get screenshot timeout")), apiTimeout)
-              );
-              
-              const { imageData } = await Promise.race([getScreenshotPromise, screenshotTimeoutPromise]) as { imageData: string };
-              
-              // Update only the screenshot
-              updateConnection(conn.address, { screenshot: imageData });
-            } catch (error) {
-              // If screenshot fetch fails for a locked connection, unlock it to allow reconnection
-              updateConnection(conn.address, { 
-                locked: false,
-                error: "Screenshot fetch failed - connection unlocked"
-              });
-            }
-            return;
-          }
-        } catch (error) {
-          // If any error occurs with a locked connection, unlock it
-          updateConnection(conn.address, { 
-            locked: false,
-            connected: false,
-            error: "Connection error - unlocked"
-          });
-        }
-      }
-
-      // Check if we've already connected to this OBS instance in this session
-      if (sessionConnectionsRef.current.has(conn.address) && !obsInstancesRef.current.get(conn.address)?.identified) {
-        // We've tried to connect in this session but it failed, don't retry constantly
-        const cooldown = 30000; // 30 seconds between retries for failed connections
-        const now = Date.now();
-        
-        if (conn.lastAttemptTime && now - conn.lastAttemptTime < cooldown) {
-          return; // Skip until cooldown expires
-        }
-      }
-
-      // Standard cooldown for connection attempts (5 seconds)
-      const cooldown = 5000;
-      const now = Date.now();
-
-      // Check if enough time has passed since the last attempt
-      if (conn.lastAttemptTime && now - conn.lastAttemptTime < cooldown) {
-        // Too soon to attempt again, skip this interval cycle
-        return;
-      }
-
-      // Update last attempt time before trying to connect
-      updateConnection(conn.address, { lastAttemptTime: now });
-
-      try {
-        let obs = obsInstancesRef.current.get(conn.address);
-
-        // Create new connection if it doesn't exist or is disconnected
-        if (!obs || !obs.identified) {
-          // If we've already tried to connect in this session and failed, don't keep trying constantly
-          if (sessionConnectionsRef.current.has(conn.address) && !conn.sessionConnected) {
-            updateConnection(conn.address, { 
-              connected: false,
-              error: "Connection failed - will retry later" 
-            });
-            return;
-          }
-
-          obs = new OBSWebSocket();
-          obsInstancesRef.current.set(conn.address, obs);
-
-          // Connect with timeout
-          const connectPromise = obs.connect(conn.address, undefined, {
-            rpcVersion: 1,
-          })
-
-          const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("Connection timeout")), 2000),
-          )
-
-          await Promise.race([connectPromise, timeoutPromise])
-
-          // Mark that we've connected in this session
-          sessionConnectionsRef.current.add(conn.address);
-          
-          // Update connection status and lock it by default when successfully connected
-          updateConnection(conn.address, { 
-            connected: true, 
-            error: undefined,
-            sessionConnected: true,
-            locked: true // Lock the connection once established
-          });
-        }
-
-        // If connected (either just connected or already connected), get scene and screenshot
-        if (obs && obs.identified) {
-          const apiTimeout = 1500; // 1.5 second timeout for API calls
-
-          const getScenePromise = obs.call("GetCurrentProgramScene");
-          const getScreenshotPromise = (sceneName: string) => obs.call("GetSourceScreenshot", {
-            sourceName: sceneName,
-            imageFormat: "jpg",
-            imageWidth: 320,
-            imageHeight: 180,
-          });
-
-          const sceneTimeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("Get scene timeout")), apiTimeout)
-          );
-
-          const { currentProgramSceneName } = await Promise.race([getScenePromise, sceneTimeoutPromise]) as { currentProgramSceneName: string };
-
-          const screenshotTimeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("Get screenshot timeout")), apiTimeout)
-          );
-
-          const { imageData } = await Promise.race([getScreenshotPromise(currentProgramSceneName), screenshotTimeoutPromise]) as { imageData: string };
-
-          // Update only the screenshot and ensure connection is locked
-          updateConnection(conn.address, { 
-            screenshot: imageData, 
-            error: undefined,
-            locked: true
-          });
-        } else if (obs && !obs.identified) {
-           // Handle case where connection was attempted but not identified (e.g., auth failure)
-           sessionConnectionsRef.current.add(conn.address); // Mark that we've tried this session
-           updateConnection(conn.address, {
-              connected: false,
-              error: "Connection not identified",
-              sessionConnected: false,
-              locked: false
-            });
-        }
-
-      } catch (error) {
-        // Connection or API call failed
-        sessionConnectionsRef.current.add(conn.address); // Mark that we've tried this session
-        
-        const obs = obsInstancesRef.current.get(conn.address)
-        if (obs) {
-          // If the error was during connection, the instance might still be there but not identified
-          // If the error was during API call, the instance might still be identified but the call failed
-          // We keep the instance but mark it as not connected and show the error.
-
-          updateConnection(conn.address, {
-            connected: false,
-            error: error instanceof Error ? error.message : "Unknown error",
-            sessionConnected: false,
-            locked: false
-          });
-        }
-        // No need to delete the instance here, it's handled by the !obs.identified check on the next interval
-      }
-    },
-    [updateConnection],
-  )
-
-  // Fetch screenshots from all connections in parallel
-  const fetchAllScreenshots = useCallback(async () => {
-    const promises = obsConnections.map((conn) => getScreenshotFromOBS(conn))
-    await Promise.allSettled(promises)
-  }, [getScreenshotFromOBS])
-
-  // Start/stop the screenshot fetching interval
-  useEffect(() => {
-    // Initial fetch
-    fetchAllScreenshots()
-
-    // Set up interval - reduced from 125ms (8fps) to 1000ms (1fps) to reduce load
-    intervalRef.current = setInterval(fetchAllScreenshots, 1000) 
-
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current)
-      }
-      // Clean up OBS connections
-      obsInstancesRef.current.forEach((obs) => {
-        try {
-          obs.disconnect()
-        } catch {}
-      })
-      obsInstancesRef.current.clear()
-    }
-  }, [fetchAllScreenshots])
-
-  // Manual refresh button handler
-  const handleRefresh = useCallback(() => {
-    // Clear session connections to allow reconnection attempts
-    sessionConnectionsRef.current.clear();
-    
-    // Unlock all connections
-    setConnections(prev => {
-      const newMap = new Map(prev);
-      for (const [address, conn] of newMap.entries()) {
-        newMap.set(address, { ...conn, locked: false });
-      }
-      return newMap;
-    });
-    
-    fetchAllScreenshots();
-  }, [fetchAllScreenshots]);
-
-  // Toggle lock for a specific connection
-  const toggleLock = useCallback((address: string) => {
-    setConnections(prev => {
-      const newMap = new Map(prev);
-      const conn = newMap.get(address);
-      if (conn) {
-        newMap.set(address, { ...conn, locked: !conn.locked });
-      }
-      return newMap;
-    });
-  }, []);
 
   // Count active feeds
   const activeCount = activeConnections.length;
@@ -539,7 +820,7 @@ export function Multiviewer() {
       {/* Active Feeds Section */}
       <div className="space-y-2">
         <h2 className="text-lg font-semibold flex items-center gap-2">
-          Active Feeds <span className="text-sm font-normal text-gray-400">({activeCount} feeds • Updates every 1 second)</span>
+          Active Feeds <span className="text-sm font-normal text-gray-400">({activeCount} feeds • Updates every 167ms (6fps))</span>
         </h2>
         
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-[10px]">
